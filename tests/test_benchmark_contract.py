@@ -98,8 +98,12 @@ def test_future_cheater_disqualified():
 def test_end_dependent_caught_by_prefix_gate():
     rep = run_benchmark(EndDependent(), _data(), split_cfg=SPLIT_SMALL)
     assert rep["gates"]["determinism"] is True
-    assert rep["gates"]["future_perturbation"] is True     # no data dependence on the future
-    assert rep["gates"]["prefix_invariance"] is False      # but the window end changes decisions
+    # This strategy ignores the data entirely and depends only on the window-end parity, so
+    # prefix-invariance is its reliable catch (asking for a shorter window flips earlier decisions).
+    # The future-perturbation probe also uses a unique window per cutoff, but under the *budgeted*
+    # (even-stride) sweep the sampled windows can share base's parity and not flag a pure
+    # parity-on-end strategy -- which is exactly why prefix-invariance is a separate gate.
+    assert rep["gates"]["prefix_invariance"] is False
     assert rep["disqualified"] is True
 
 
@@ -243,6 +247,130 @@ def test_subbar_straddle_cheater_disqualified():
     rep = run_benchmark(SubBarStraddleCheater(), data, split_cfg=SPLIT_SMALL)
     assert rep["gates"]["future_perturbation"] is False
     assert rep["disqualified"] is True
+
+
+class TailGapCheater:
+    """Honest on the first 75% of EVERY fold window; look-ahead in the tail (start+0.75n, end).
+    The pre-fix gate only forward-checked cutoffs at 0.25/0.5/0.75n and NEVER the tail, so this
+    scored a fraudulent return undisqualified (audit-3). Stride-1 coverage forward-checks every
+    interior index, so the tail peek is caught."""
+    name, horizon = "tail_gap_cheater", 1
+
+    def fit(self, data, train_start, train_end):
+        pass
+
+    def positions(self, data, start, end):
+        c = pd.to_numeric(data.candles["close"], errors="coerce").to_numpy("float64")
+        n = end - start
+        cut = start + int(n * 0.75)
+        ema = pd.Series(c[:end]).ewm(span=24, adjust=False).mean().to_numpy()
+        nxt = np.concatenate([c[1:], [c[-1]]])
+        out = np.empty(n)
+        for k, t in enumerate(range(start, end)):
+            out[k] = (1.0 if c[t] > ema[t] else 0.0) if t <= cut \
+                else (1.0 if nxt[t] > c[t] else 0.0)              # tail: peek tomorrow's close
+        return out
+
+
+def test_tail_gap_cheater_disqualified():
+    # audit-3 regression: look-ahead confined to the tail (last 25%) of each fold. Fractional cutoffs
+    # never forward-checked the tail; stride-1 coverage does.
+    rep = run_benchmark(TailGapCheater(), _data(8000), split_cfg=SPLIT_3F)
+    assert rep["gates"]["future_perturbation"] is False
+    assert rep["disqualified"] is True
+
+
+def test_single_interior_lookahead_caught_at_its_index():
+    # the sharpest form: a position that peeks ONE bar ahead at a single interior index that lies
+    # BETWEEN the old fractional cutoffs. Only stride-1 (a cutoff at every index) catches it.
+    from btc_benchmark.benchmark.validity import run_gates
+    data = _data(1000)
+    c = pd.to_numeric(data.candles["close"], errors="coerce").to_numpy("float64")
+    start, end, peek = 100, 400, 251                              # 251 avoids fracs 175/250/325
+
+    class OneIndexPeek:
+        name, horizon = "one_index_peek", 1
+
+        def fit(self, *a):
+            pass
+
+        def positions(self, d, s, e):
+            cc = pd.to_numeric(d.candles["close"], errors="coerce").to_numpy("float64")
+            o = np.zeros(e - s)
+            if s <= peek < e and peek + 1 < len(cc):             # robust to the prefix gate's short window
+                o[peek - s] = 1.0 if cc[peek + 1] > cc[peek] else 0.0
+            return o
+
+    scored = OneIndexPeek().positions(data, start, end)
+    rep = run_gates(OneIndexPeek(), data, start=start, end=end, scored=scored)
+    assert rep["future_perturbation"] is False                   # caught by the cutoff at t0=251
+    assert rep["passed"] is False
+
+
+def test_non_ohlcv_future_column_cheater_disqualified():
+    # the loader hands strategies the WHOLE processed frame (quote_volume, number_of_trades,
+    # taker_buy_*, ...). A cheater can peek at the FUTURE row of any of those numeric columns, so the
+    # perturber must perturb EVERY numeric column -- not just OHLCV. (audit self-review hole.)
+    from btc_benchmark.benchmark.validity import run_gates
+    data = _data(1000)
+    rng = np.random.default_rng(7)
+    cand = data.candles.copy()
+    cand["number_of_trades"] = rng.uniform(1.0, 100.0, len(cand))   # causal benign non-OHLCV column
+    data = BenchmarkData(candles=cand, aux=data.aux)
+    start, end = 100, 400
+
+    class FutureTradesCheater:
+        name, horizon = "future_trades_cheater", 1
+
+        def fit(self, *a):
+            pass
+
+        def positions(self, d, s, e):
+            nt = pd.to_numeric(d.candles["number_of_trades"], errors="coerce").to_numpy("float64")
+            o = np.zeros(e - s)
+            for k, t in enumerate(range(s, e)):
+                nxt = nt[t + 1] if t + 1 < len(nt) else nt[t]       # FUTURE row of a non-OHLCV column
+                o[k] = 1.0 if nxt > nt[t] else 0.0
+            return o
+
+    scored = FutureTradesCheater().positions(data, start, end)
+    rep = run_gates(FutureTradesCheater(), data, start=start, end=end, scored=scored)
+    assert rep["future_perturbation"] is False                     # caught: the column's future is perturbed
+    assert rep["passed"] is False
+
+
+def test_cache_replay_lookahead_cheater_disqualified():
+    # a STATEFUL cheater: computes look-ahead ONCE on the scored call and memoises it keyed by
+    # (start, end), replaying that array on every later call. Fixed-window perturbation would hit the
+    # cache and pass; the per-cutoff UNIQUE window [start, t0+2) forces a recompute on perturbed data.
+    from btc_benchmark.benchmark.validity import run_gates
+    data = _data(1000)
+    start, end = 100, 400
+
+    class CacheReplay:
+        name, horizon = "cache_replay", 1
+
+        def __init__(self):
+            self._cache: dict = {}
+
+        def fit(self, *a):
+            pass
+
+        def positions(self, d, s, e):
+            key = (s, e)
+            if key in self._cache:
+                return self._cache[key]                     # replay -> ignores the perturbed data
+            c = pd.to_numeric(d.candles["close"], errors="coerce").to_numpy("float64")
+            nxt = np.concatenate([c[1:], [c[-1]]])
+            out = (nxt[s:e] > c[s:e]).astype("float64")      # look-ahead, computed once on the clean call
+            self._cache[key] = out
+            return out
+
+    strat = CacheReplay()
+    scored = strat.positions(data, start, end)              # scored call caches the cheat under (100,400)
+    rep = run_gates(strat, data, start=start, end=end, scored=scored)
+    assert rep["future_perturbation"] is False              # unique short windows defeat the replay
+    assert rep["passed"] is False
 
 
 def test_trade_log_includes_exit_cost_and_bh_uses_last_bar():

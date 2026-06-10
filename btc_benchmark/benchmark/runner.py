@@ -76,7 +76,8 @@ def _per_year(net: np.ndarray, ts: pd.Series) -> dict:
 
 
 def run_benchmark(strategy: Strategy, data: BenchmarkData, *, split_cfg: dict | None = None,
-                  gates: bool = True, leaderboard_path: str | Path | None = None,
+                  gates: bool = True, gate_max_cutoffs: int | None = 512,
+                  leaderboard_path: str | Path | None = None,
                   team: str = "anonymous") -> dict:
     """Evaluate one strategy submission. Returns the report dict (and appends the leaderboard)."""
     horizon = max(1, int(getattr(strategy, "horizon", 1)))
@@ -104,7 +105,8 @@ def run_benchmark(strategy: Strategy, data: BenchmarkData, *, split_cfg: dict | 
         # gate's recomputed calls)
         if gates:
             fold_gates.append({"fold": int(s.split_id),
-                               **run_gates(strategy, data, start=te0, end=te1, scored=pos)})
+                               **run_gates(strategy, data, start=te0, end=te1, scored=pos,
+                                           max_cutoffs=gate_max_cutoffs)})
         blocks.append((te0, te1, pos))
 
     # consolidate (test windows tile; keep first on overlap), positions aligned to candle rows
@@ -127,6 +129,10 @@ def run_benchmark(strategy: Strategy, data: BenchmarkData, *, split_cfg: dict | 
                     "failed_folds": [g["fold"] for g in failed],
                     "determinism": all(g["determinism"] for g in fold_gates),
                     "future_perturbation": all(g["future_perturbation"] for g in fold_gates),
+                    "future_perturbation_exhaustive": all(
+                        g.get("future_perturbation_exhaustive", False) for g in fold_gates),
+                    "future_perturbation_cutoffs_min": min(
+                        (g.get("future_perturbation_cutoffs", 0) for g in fold_gates), default=0),
                     "prefix_invariance": all(g["prefix_invariance"] for g in fold_gates),
                     "per_fold": fold_gates}
     else:

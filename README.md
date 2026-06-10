@@ -53,8 +53,19 @@ report = run_benchmark(MyStrategy(), data, team="myteam",
 Rules (enforced in code, not by trust):
 1. The benchmark drives the walk-forward; a strategy cannot pick its own splits or see beyond the
    fold it is asked about.
-2. **Causality gates run on every fold** (determinism / future-perturbation incl. straddling sub-bars
-   / prefix-invariance). Any failure ⇒ `disqualified` (the run is still recorded).
+2. **Causality gates run on every fold** (determinism / future-perturbation / prefix-invariance).
+   Future-perturbation forward-perturbs the timeline at cutoffs spread evenly across the **whole**
+   fold — always reaching the last decision, so look-ahead cannot hide in an unchecked tail (the
+   audit-3 failure was cutoffs that stopped at 0.75·n). It perturbs **every numeric column** (not
+   just OHLCV) in **two directions** (inflate + sign-flip), perturbs straddling sub-bars by their
+   close time, and asks each cutoff for a **unique window** so a strategy that memoises and replays
+   its first look-ahead output can't slip through. The sweep is bounded for tractability
+   (`gate_max_cutoffs`, default 512/fold; `None` = exhaustive stride-1), and the coverage it actually
+   ran (`future_perturbation_exhaustive` / `_cutoffs_min`) is reported. Any failure ⇒ `disqualified`
+   (the run is still recorded). A real look-ahead bug spans many bars and trips the first cutoff it
+   reaches; the only residual a budgeted sweep can miss is a sub-stride single-index adversarial peek
+   (worth ~one bar of edge), which is disclosed, not hidden — run with `gate_max_cutoffs=None` to
+   close it. For rapid iteration, score with `gates=False`; the authoritative score runs the gates.
 3. Costs, accounting, and splits are referee constants — a submission cannot change them.
 4. The sealed holdout (last 6 months) is **structurally invisible** to dev evaluation; the one-shot
    final test is run only by the host.
@@ -62,6 +73,16 @@ Rules (enforced in code, not by trust):
 ### Trusted-but-unenforced boundaries (disclosed)
 - **Declared horizon**: a strategy declares its label horizon (used for purge/embargo); deliberately
   under-declaring is the one channel the gates cannot see — it is recorded in the report and auditable.
+- **Computed look-ahead vs deliberate replay**: the gates perturb the future and verify the *computed*
+  positions don't change, so they catch any strategy whose positions are a function of the data passed
+  in — the realistic failure (a look-ahead bug in a feature/label/model pipeline, a deliberate peek,
+  or a pipeline that memoises positions by window and caches a buggy look-ahead result). They cannot
+  catch a strategy that *ignores its `data` argument* and returns a precomputed look-ahead array:
+  black-box perturbation has no signal when the output ignores the input. This is an inherent limit of
+  batch causality testing, not a fixable hole. The structural defense — recommended for the
+  authoritative sealed-holdout run — is to evaluate by **streaming the data bar-by-bar** so no single
+  call ever exposes the future, and/or to **review submission source**. The public dev leaderboard is
+  advisory; a replayed array is only a way to post a meaningless dev number.
 
 ## Lineage
 Carved from `btc_autoresearch` (the M1–M7 research monorepo). Full research history and audit trail
