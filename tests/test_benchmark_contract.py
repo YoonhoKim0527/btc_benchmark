@@ -133,10 +133,15 @@ def test_load_benchmark_data_real_repo():
 
 
 # ===== audit regressions (C1 fold-selective bypass, H2 sub-bar straddle, M1/M2 accounting) =====
-class FoldSelectiveCheater:
-    """Causal ONLY on the first test fold; uses close[t+1] look-ahead on every other fold.
-    Pre-fix this passed (gates ran on one fold); now every fold is gated -> must be disqualified."""
-    name, horizon = "fold_selective_cheater", 1
+# 3+ folds so that gating only the MIDDLE fold (the pre-fix behavior) would MISS a cheater honest
+# only on that fold -- proving the all-fold fix, not a lucky split.
+SPLIT_3F = {"train_months": 2, "val_months": 1, "test_months": 1, "step_months": 1,
+            "embargo_bars": None, "purge_overlapping_labels": True, "sealed_holdout_months": 1}
+
+
+class MiddleFoldOnlyHonest:
+    """Honest ONLY on the fold a single-middle-fold gate would have sampled; look-ahead elsewhere."""
+    name, horizon = "middle_fold_only_honest", 1
 
     def __init__(self):
         from btc_benchmark.backtest.walk_forward import WalkForwardConfig, generate_splits
@@ -146,24 +151,60 @@ class FoldSelectiveCheater:
         pass
 
     def positions(self, data, start, end):
-        WalkForwardConfig, generate_splits = self._wf
-        splits, _ = generate_splits(data.candles["timestamp_open"],
-                                    WalkForwardConfig.from_dict({**SPLIT_SMALL, "horizon_bars": 1}))
-        honest_fold = splits[0].test_range if splits else (start, end)
+        WFC, gen = self._wf
+        splits, _ = gen(data.candles["timestamp_open"], WFC.from_dict({**SPLIT_3F, "horizon_bars": 1}))
+        honest = splits[len(splits) // 2].test_range if splits else (start, end)
         c = pd.to_numeric(data.candles["close"], errors="coerce").to_numpy("float64")
-        if (start, end) == tuple(honest_fold):
+        if (start, end) == tuple(honest):
             ema = pd.Series(c[:end]).ewm(span=24, adjust=False).mean().to_numpy()
             return (c[start:end] > ema[start:end]).astype("float64")
-        nxt = np.concatenate([c[1:], [c[-1]]])               # look-ahead on the other folds
+        nxt = np.concatenate([c[1:], [c[-1]]])
         return (nxt[start:end] > c[start:end]).astype("float64")
 
 
+class FirstCallCheater:
+    """Cheats on the FIRST positions() call per (start,end) key (the SCORED call), honest on every
+    later call (the gate's recomputes). Defeated only by gating the scored array (re-audit headline)."""
+    name, horizon = "first_call_cheater", 1
+
+    def __init__(self):
+        self._seen: set = set()
+
+    def fit(self, data, train_start, train_end):
+        pass
+
+    def positions(self, data, start, end):
+        c = pd.to_numeric(data.candles["close"], errors="coerce").to_numpy("float64")
+        key = (start, end)
+        if key not in self._seen:
+            self._seen.add(key)
+            nxt = np.concatenate([c[1:], [c[-1]]])           # look-ahead on the SCORED call
+            return (nxt[start:end] > c[start:end]).astype("float64")
+        ema = pd.Series(c[:end]).ewm(span=24, adjust=False).mean().to_numpy()  # honest on gate recalls
+        return (c[start:end] > ema[start:end]).astype("float64")
+
+
 def test_fold_selective_cheater_now_disqualified():
-    rep = run_benchmark(FoldSelectiveCheater(), _data(), split_cfg=SPLIT_SMALL)
-    assert rep["gates"]["scope"] == "all_folds"
-    assert rep["gates"]["future_perturbation"] is False      # caught on a non-honest fold
+    rep = run_benchmark(MiddleFoldOnlyHonest(), _data(8000), split_cfg=SPLIT_3F)
+    assert rep["gates"]["scope"] == "all_folds" and rep["gates"]["n_folds_gated"] >= 3
     assert rep["disqualified"] is True
-    assert len(rep["gates"]["failed_folds"]) >= 1
+    mid = rep["gates"]["n_folds_gated"] // 2
+    assert any(f != mid for f in rep["gates"]["failed_folds"])     # a non-middle fold caught it
+
+
+def test_first_call_scored_array_cheater_disqualified():
+    # the re-audit headline: scored on the cheat, gated on honesty. Caught only because the
+    # determinism gate now compares the SCORED array against a recompute.
+    rep = run_benchmark(FirstCallCheater(), _data(8000), split_cfg=SPLIT_3F)
+    assert rep["gates"]["determinism"] is False
+    assert rep["disqualified"] is True
+
+
+def test_tiny_window_fold_fails_closed():
+    from btc_benchmark.benchmark.validity import run_gates
+    rep = run_gates(EmaRule(), _data(200), start=50, end=51, scored=np.array([0.0]))
+    assert rep["future_perturbation"] is False and rep["prefix_invariance"] is False
+    assert rep["passed"] is False
 
 
 class SubBarStraddleCheater:
@@ -219,3 +260,15 @@ def test_trade_log_includes_exit_cost_and_bh_uses_last_bar():
     # entry (bar 10) + exit (bar 20) both 1 unit * 10bps -> 20 bps round-trip, now in the trade row
     assert abs(tr["cost_paid"] - 2 * 10.0 / 10000.0) < 1e-12
     assert abs(float(res.costs.sum()) - tr["cost_paid"]) < 1e-12   # whole portfolio = this one trade
+    # INVARIANT (flat/flip/scale): sum of per-trade cost_paid == portfolio cost, no double-count
+    for pat in (np.array([0, 1, 1, 0, -1, -1, 0, 1, 0], "float64"),          # flat + flip
+                np.array([0, 1, 0.5, 1, -0.3, -1, 0, 0.7, 0], "float64"),    # scale + fractional flip
+                np.array([0, -1, -1, -1, 1, 1, 0, 0, 0], "float64")):        # direct flip mid-run
+        m = len(pat)
+        ts2 = pd.date_range("2022-01-01", periods=m, freq="1h", tz="UTC")
+        cdl = pd.DataFrame({"timestamp_open": ts2,
+                            "timestamp_close": ts2 + pd.Timedelta(hours=1) - pd.Timedelta(milliseconds=1),
+                            "open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0,
+                            "volume": 1.0, "is_imputed": False})
+        r = run_backtest(cdl, pat, CostConfig(fee_bps=10.0), periods_per_year=8760)
+        assert abs(float(r.trades["cost_paid"].sum()) - float(r.costs.sum())) < 1e-12, pat.tolist()

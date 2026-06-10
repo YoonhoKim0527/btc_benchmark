@@ -18,8 +18,6 @@ import pandas as pd
 
 from .contract import BenchmarkData, Strategy
 
-# aux frames keyed by their EVENT time (the instant the info becomes known)
-_EVENT_TIME_AUX = {"funding", "open_interest", "mark_premium", "premium"}
 # sub-bar kline frames keyed by OPEN time -> info is known only at open + interval (the bar close)
 _SUBBAR_INTERVAL_MIN = {"sub1": 1, "sub5": 5, "sub15": 15}
 _NUMERIC_SKIP = {"event_time", "timestamp_open", "timestamp_close"}
@@ -64,39 +62,49 @@ def _perturb_after(data: BenchmarkData, cutoff_ts: pd.Timestamp) -> BenchmarkDat
     return BenchmarkData(candles=c, aux=aux2)
 
 
-def run_gates(strategy: Strategy, data: BenchmarkData, *, start: int, end: int) -> dict:
-    """Run all gates on one (already-fit) fold window [start, end). Returns a report dict.
+def run_gates(strategy: Strategy, data: BenchmarkData, *, start: int, end: int,
+              scored: np.ndarray) -> dict:
+    """Validate the EXACT positions array that was scored for fold [start, end).
 
-    The runner calls this for EVERY fold (see runner.run_benchmark), so passing requires causal
-    behavior on the whole evaluated timeline, not one sampled window."""
+    CRITICAL: `scored` is the array the runner actually scored (its first positions() call for this
+    fold). All gates compare against THIS array -- never an independently-recomputed one -- so a
+    strategy cannot cheat on the scored call and behave honestly on the gate's calls. The runner
+    calls this for EVERY fold, so passing requires causal behavior on the whole evaluated timeline.
+    A fold whose window is too small to execute any forward/prefix check fails CLOSED (cannot be
+    scored-but-ungated)."""
     out: dict = {}
-    base = np.asarray(strategy.positions(data, start, end), dtype="float64")
-    again = np.asarray(strategy.positions(data, start, end), dtype="float64")
-    out["determinism"] = bool(np.array_equal(base, again, equal_nan=True))
-
-    # future-perturbation at several interior cutoffs (not just the midpoint), each perturbing the
-    # WHOLE forward timeline + straddling sub-bars
-    fp_ok = True
+    base = np.asarray(scored, dtype="float64")
     n = end - start
+
+    # determinism: re-calling positions() must reproduce the SCORED array (catches a strategy that
+    # serves look-ahead on the scored call and honest positions on later calls).
+    again = np.asarray(strategy.positions(data, start, end), dtype="float64")
+    out["determinism"] = bool(again.shape == base.shape and np.array_equal(base, again, equal_nan=True))
+
+    # future-perturbation at several interior cutoffs: perturb the WHOLE forward timeline (+straddling
+    # sub-bars); the SCORED array's prefix [:t0+1] must be unchanged.
+    fp_ok, fp_ran = True, 0
     for frac in (0.25, 0.5, 0.75):
         t0 = start + int(n * frac)
         if not (start < t0 < end):
             continue
+        fp_ran += 1
         cutoff = pd.to_datetime(data.candles["timestamp_close"].iloc[t0], utc=True)
         pert = np.asarray(strategy.positions(_perturb_after(data, cutoff), start, end), "float64")
         k = t0 - start + 1
-        fp_ok = fp_ok and bool(np.array_equal(base[:k], pert[:k], equal_nan=True))
-    out["future_perturbation"] = fp_ok
+        fp_ok = fp_ok and bool(pert.shape == base.shape and np.array_equal(base[:k], pert[:k], equal_nan=True))
+    out["future_perturbation"] = bool(fp_ok and fp_ran > 0)        # fail closed if no cutoff ran
 
-    # prefix invariance at two offsets (half-window catches window-statistic cheats; end-1 odd offset
-    # so parity/periodic end-dependence cannot line up with both)
-    pi_ok = True
+    # prefix invariance: asking for a shorter window cannot change earlier (scored) decisions.
+    pi_ok, pi_ran = True, 0
     for mid in (start + n // 2, end - 1):
         if mid <= start:
             continue
+        pi_ran += 1
         short = np.asarray(strategy.positions(data, start, mid), dtype="float64")
-        pi_ok = pi_ok and bool(np.array_equal(base[: mid - start], short, equal_nan=True))
-    out["prefix_invariance"] = pi_ok
+        pi_ok = pi_ok and bool(short.shape == (mid - start,)
+                               and np.array_equal(base[: mid - start], short, equal_nan=True))
+    out["prefix_invariance"] = bool(pi_ok and pi_ran > 0)          # fail closed if no prefix ran
 
     out["passed"] = bool(out["determinism"] and out["future_perturbation"] and out["prefix_invariance"])
     out["gate_window"] = [int(start), int(end)]

@@ -99,10 +99,12 @@ def run_benchmark(strategy: Strategy, data: BenchmarkData, *, split_cfg: dict | 
         finite = pos[np.isfinite(pos)]
         if finite.size and np.abs(finite).max() > 1.0 + 1e-9:
             raise ValueError("positions must lie in [-1, 1]")
-        # gate EVERY fold's test window (a strategy cannot be causal on one fold and cheat elsewhere)
+        # gate EVERY fold's test window against the EXACT scored array `pos` (a strategy cannot be
+        # causal on one fold and cheat elsewhere, nor cheat on the scored call and be honest on the
+        # gate's recomputed calls)
         if gates:
             fold_gates.append({"fold": int(s.split_id),
-                               **run_gates(strategy, data, start=te0, end=te1)})
+                               **run_gates(strategy, data, start=te0, end=te1, scored=pos)})
         blocks.append((te0, te1, pos))
 
     # consolidate (test windows tile; keep first on overlap), positions aligned to candle rows

@@ -91,19 +91,35 @@ def _build_trade_log(pos, entry_px, exit_px, gross, net, cost, fund, hold_start,
         while j + 1 < M and pos[j + 1] == pos[i]:
             j += 1
         sl = slice(i, j + 1)
-        # The trade is held over bars [i, j]; its EXIT turnover is charged at bar j+1 (outside `sl`).
-        # Attribute the exit leg to THIS trade so cost_paid / net_return are full round-trip figures.
-        # cost[t] = |p[t]-p[t-1]| * cost_dec, so cost_dec at the exit bar = cost[j+1] / turnover[j+1];
-        # the exit leg closes |pos[j]| units (full on a flat exit, half on a direct flip).
-        exit_cost = 0.0
-        if j + 1 < M:
-            old, new = float(pos[j]), float(pos[j + 1])
+        # Round-trip cost = ENTRY leg (at bar i) + holding costs (i+1..j, usually 0) + EXIT leg (at
+        # bar j+1). The turnover at a boundary bar is shared by the trade closing there and the trade
+        # opening there (a flip charges 2 units: 1 exit + 1 entry), so we split each boundary bar's
+        # cost into its exit/entry legs and give each trade only ITS leg -- this makes the per-trade
+        # cost_paid sum to the portfolio cost EXACTLY (asserted in tests) for flat/flip/scale exits.
+        # cost[t] = |p[t]-p[t-1]| * cost_dec, so cost_dec at bar t = cost[t] / turnover[t].
+        def _entry_leg(b: int) -> float:
+            prev = pos[b - 1] if b > 0 else 0.0
+            cur = float(pos[b])
+            tot = abs(cur - prev)
+            if tot <= 1e-12:
+                return 0.0
+            units = abs(cur) if (prev == 0.0 or np.sign(prev) != np.sign(cur)) else max(0.0, abs(cur) - abs(prev))
+            return units * (float(cost[b]) / tot)
+
+        def _exit_leg(b: int) -> float:                          # b = the bar AFTER the trade (j+1)
+            old, new = float(pos[b - 1]), float(pos[b])
             tot = abs(new - old)
-            if tot > 1e-12:
-                cost_dec = float(cost[j + 1]) / tot
-                exit_units = (abs(old) if (new == 0.0 or np.sign(new) != np.sign(old))
-                              else max(0.0, abs(old) - abs(new)))
-                exit_cost = exit_units * cost_dec
+            if tot <= 1e-12:
+                return 0.0
+            units = abs(old) if (new == 0.0 or np.sign(new) != np.sign(old)) else max(0.0, abs(old) - abs(new))
+            return units * (float(cost[b]) / tot)
+
+        entry_cost = _entry_leg(i)
+        exit_cost = _exit_leg(j + 1) if j + 1 < M else 0.0
+        holding_cost = float(np.sum(cost[i + 1:j + 1]))          # mid-hold costs (constant pos -> 0)
+        trade_cost = entry_cost + holding_cost + exit_cost
+        # net excluding the entry bar's full cost, then re-apply the entry+exit LEGS as drags
+        gross_factor = float(np.prod(1.0 + gross[sl]))
         rows.append({
             "trade_id": tid,
             "entry_time": hold_start[i],
@@ -111,9 +127,9 @@ def _build_trade_log(pos, entry_px, exit_px, gross, net, cost, fund, hold_start,
             "side": "long" if pos[i] > 0 else "short",
             "entry_price": float(entry_px[i]),
             "exit_price": float(exit_px[j]),
-            "gross_return": float(np.prod(1.0 + gross[sl]) - 1.0),
-            "net_return": float(np.prod(1.0 + net[sl]) - 1.0) - exit_cost,
-            "cost_paid": float(np.sum(cost[sl])) + exit_cost,
+            "gross_return": float(gross_factor - 1.0),
+            "net_return": float(gross_factor - 1.0) - trade_cost,
+            "cost_paid": trade_cost,
             "funding_paid": float(np.sum(fund[sl])),
             "holding_period_bars": int(j - i + 1),
             "exit_reason": "signal" if j + 1 < M else "end_of_data",
