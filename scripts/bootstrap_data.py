@@ -1,7 +1,7 @@
 """One-command data bootstrap for benchmark users (clone -> this -> run strategies).
 
 Rebuilds the full data bundle from Binance Data Vision (public, checksum-verified):
-  1h klines -> validate -> impute -> processed canonical   (~5 MB, required)
+  1h klines -> impute -> processed canonical -> validate   (~5 MB, required)
   funding / open-interest / mark-premium                    (aux, recommended)
   5m / 15m / 1m sub-klines                                  (aux, optional: --with-sub-bars)
 
@@ -33,9 +33,12 @@ def main() -> None:
     args = ap.parse_args()
     common = ["--market", MARKET, "--symbol", SYMBOL]
 
-    run("btc_benchmark.data.download_binance", *common, "--interval", "1h", "--start", args.start)
-    run("btc_benchmark.data.validate_data", *common, "--interval", "1h")
+    # order matters: download raw -> impute (raw -> processed canonical) -> validate (processed).
+    # --gapfill backfills months absent from the Data Vision monthly archives (e.g. 2019) via REST.
+    run("btc_benchmark.data.download_binance", *common, "--interval", "1h", "--start", args.start,
+        "--gapfill")
     run("btc_benchmark.data.impute", *common, "--interval", "1h", "--policy", "flat_bar_fill")
+    run("btc_benchmark.data.validate_data", *common, "--interval", "1h")
     # per-source Data Vision history starts (earlier months just don't exist upstream)
     for kind, kstart in (("funding", "2021-11-01"), ("open_interest", "2021-01-01"),
                          ("mark_premium", "2020-01-01")):

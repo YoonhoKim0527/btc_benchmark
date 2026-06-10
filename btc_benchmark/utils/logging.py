@@ -1,4 +1,4 @@
-"""Structured logging for btc_autoresearch."""
+"""Structured logging for btc_benchmark."""
 from __future__ import annotations
 
 import logging
@@ -7,7 +7,7 @@ import sys
 _FORMAT = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
 
 
-def get_logger(name: str = "btc_autoresearch", level: int = logging.INFO) -> logging.Logger:
+def get_logger(name: str = "btc_benchmark", level: int = logging.INFO) -> logging.Logger:
     """Return a process-wide logger that writes to stdout exactly once.
 
     Idempotent: repeated calls with the same name reuse the same handler.

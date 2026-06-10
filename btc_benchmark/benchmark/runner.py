@@ -87,6 +87,7 @@ def run_benchmark(strategy: Strategy, data: BenchmarkData, *, split_cfg: dict | 
     holdout_start = holdout.get("start_idx") or len(data.candles)
 
     blocks: list[tuple[int, int, np.ndarray]] = []
+    fold_gates: list[dict] = []
     for s in splits:
         tr0, tr1 = s.train_range
         te0, te1 = s.test_range
@@ -95,8 +96,13 @@ def run_benchmark(strategy: Strategy, data: BenchmarkData, *, split_cfg: dict | 
         pos = np.asarray(strategy.positions(data, te0, te1), dtype="float64")
         if pos.shape != (te1 - te0,):
             raise ValueError(f"strategy returned {pos.shape}, expected ({te1 - te0},) for fold {s.split_id}")
-        if np.nanmax(np.abs(pos)) > 1.0 + 1e-9:
+        finite = pos[np.isfinite(pos)]
+        if finite.size and np.abs(finite).max() > 1.0 + 1e-9:
             raise ValueError("positions must lie in [-1, 1]")
+        # gate EVERY fold's test window (a strategy cannot be causal on one fold and cheat elsewhere)
+        if gates:
+            fold_gates.append({"fold": int(s.split_id),
+                               **run_gates(strategy, data, start=te0, end=te1)})
         blocks.append((te0, te1, pos))
 
     # consolidate (test windows tile; keep first on overlap), positions aligned to candle rows
@@ -111,11 +117,18 @@ def run_benchmark(strategy: Strategy, data: BenchmarkData, *, split_cfg: dict | 
     cons = data.candles.iloc[first:last].reset_index(drop=True)
     pos_full = np.where(np.isfinite(pos_full), pos_full, 0.0)
 
-    gate_rep: dict = {"skipped": True}
+    gate_rep: dict
     if gates:
-        gs = splits[len(splits) // 2]
-        strategy.fit(data, gs.train_range[0], gs.train_range[1])     # re-fit the sampled fold
-        gate_rep = run_gates(strategy, data, start=gs.test_range[0], end=gs.test_range[1])
+        failed = [g for g in fold_gates if not g.get("passed", False)]
+        gate_rep = {"scope": "all_folds", "n_folds_gated": len(fold_gates),
+                    "passed": len(failed) == 0,
+                    "failed_folds": [g["fold"] for g in failed],
+                    "determinism": all(g["determinism"] for g in fold_gates),
+                    "future_perturbation": all(g["future_perturbation"] for g in fold_gates),
+                    "prefix_invariance": all(g["prefix_invariance"] for g in fold_gates),
+                    "per_fold": fold_gates}
+    else:
+        gate_rep = {"skipped": True, "passed": True}
     disqualified = bool(gates and not gate_rep.get("passed", False))
 
     res = run_backtest(cons, pos_full, CostConfig(fee_bps=ALL_IN_BPS), periods_per_year=PPY)
@@ -153,7 +166,7 @@ def run_benchmark(strategy: Strategy, data: BenchmarkData, *, split_cfg: dict | 
         "net_next_open": round(float(res_no.metrics(periods_per_year=PPY)["total_net_return"]), 4),
         "net_funding_aware": fund_net, "random_pctile": rnd_pct,
         "per_year": _per_year(np.asarray(res.net_returns, "float64"), cons["timestamp_open"]),
-        "buy_hold_net": round(float(close[-2] / close[0] - 1.0), 4) if len(close) > 2 else None,
+        "buy_hold_net": round(float(close[-1] / close[0] - 1.0), 4) if len(close) > 1 else None,
         "sealed_holdout_used": False,
     }
     if leaderboard_path is not None:
